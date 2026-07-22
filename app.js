@@ -1,0 +1,486 @@
+(function () {
+  "use strict";
+
+  const TYPE_LABELS = {
+    rosso: "Rosso",
+    bianco: "Bianco",
+    champagne: "Champagne / Bollicine",
+    rosato: "Rosato",
+    dolce: "Dolce",
+    altro: "Altro",
+  };
+
+  const SETTINGS_KEY = "sommelier_settings_v1";
+
+  function loadSettings() {
+    try {
+      const raw = localStorage.getItem(SETTINGS_KEY);
+      if (!raw) return { apiKey: "", model: "claude-sonnet-5" };
+      const parsed = JSON.parse(raw);
+      return { apiKey: parsed.apiKey || "", model: parsed.model || "claude-sonnet-5" };
+    } catch (e) {
+      return { apiKey: "", model: "claude-sonnet-5" };
+    }
+  }
+
+  function saveSettings(settings) {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  }
+
+  const state = {
+    settings: loadSettings(),
+    showSettings: false,
+    rawText: "",
+    files: [], // {id, name, kind, mediaType, base64}
+    parsing: false,
+    parseError: "",
+    parsedWines: null,
+    budget: 1000,
+    colorPref: "tutti",
+    stylePref: "tutti",
+    recommending: false,
+    recError: "",
+    recommendations: null,
+  };
+
+  function mostCommonCurrency(wines) {
+    const counts = {};
+    wines.forEach((w) => {
+      if (w.currency) counts[w.currency] = (counts[w.currency] || 0) + 1;
+    });
+    let best = "", bestCount = 0;
+    Object.entries(counts).forEach(([c, n]) => {
+      if (n > bestCount) { best = c; bestCount = n; }
+    });
+    return best;
+  }
+
+  function parseJsonSafe(text) {
+    const cleaned = text.replace(/```json/gi, "").replace(/```/g, "").trim();
+    try {
+      return JSON.parse(cleaned);
+    } catch (e) {
+      const match = cleaned.match(/(\[[\s\S]*\])/);
+      if (match) {
+        try { return JSON.parse(match[1]); } catch (e2) { throw new Error("Non sono riuscito a leggere la risposta del modello."); }
+      }
+      throw new Error("Non sono riuscito a leggere la risposta del modello.");
+    }
+  }
+
+  function readFileAsBase64(file) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result.split(",")[1]);
+      r.onerror = () => reject(new Error("Lettura file fallita"));
+      r.readAsDataURL(file);
+    });
+  }
+
+  async function callClaude(content, maxTokens) {
+    if (!state.settings.apiKey) {
+      throw new Error("Aggiungi la tua chiave API Anthropic nelle impostazioni (icona ingranaggio) prima di continuare.");
+    }
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": state.settings.apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify({
+        model: state.settings.model || "claude-sonnet-5",
+        max_tokens: maxTokens,
+        messages: [{ role: "user", content }],
+      }),
+    });
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      throw new Error("Errore API (" + res.status + "): " + errText.slice(0, 200));
+    }
+    const data = await res.json();
+    return (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+  }
+
+  const PARSE_INSTRUCTIONS = `Analizza il contenuto sopra (testo incollato e/o immagini/PDF di una carta dei vini di ristorante). La carta puo' essere disordinata, scritta a mano, scansionata o organizzata per regioni.
+
+Estrai OGNI vino/bottiglia che riesci a identificare come un oggetto con questi campi:
+- name: nome della cuvee/etichetta (senza produttore, senza annata)
+- producer: nome del produttore/cantina
+- region: regione o denominazione (se nota, altrimenti stringa vuota)
+- vintage: annata come numero, o null se non millesimato
+- type: uno tra "rosso", "bianco", "champagne", "rosato", "dolce", "altro"
+- price: prezzo come numero (solo cifre), o null se assente
+- currency: valuta stimata come sigla (es. "DKK", "EUR", "CHF"), stringa vuota se ignota
+- style: se deducibile, uno tra "naturale", "biodinamico", "classico" o null
+- raw: la riga originale
+
+Rispondi SOLO con un array JSON valido di questi oggetti, senza testo introduttivo, senza commenti, senza blocchi markdown.`;
+
+  function buildRecommendInstructions({ budget, currency, colorPref, stylePref, fallbackUsed }) {
+    return `Sei un sommelier. Ti fornisco un elenco di vini candidati (in JSON) gia' pre-filtrato da un budget massimo di ${budget}${currency ? " " + currency : ""} per bottiglia.
+
+Preferenza di colore/tipologia richiesta: ${colorPref === "tutti" ? "nessuna, va bene qualsiasi tipologia" : (TYPE_LABELS[colorPref] || colorPref)}.
+Preferenza di stile richiesta: ${stylePref === "tutti" ? "nessuna preferenza particolare" : stylePref}.
+${fallbackUsed ? "Nota: nessun vino rispettava esattamente colore/stile richiesti entro budget, quindi ti sto passando i migliori candidati solo filtrati per budget: rilassa i criteri secondari ma spiegalo brevemente nella motivazione." : ""}
+
+Scegli le 4 proposte migliori (o meno di 4 se i candidati sono meno di 4), privilegiando a parita' di merito i produttori piccoli/indipendenti e le etichette meno scontate rispetto ai nomi piu' commerciali, e cercando di variare regione/stile tra le proposte quando possibile.
+
+Rispondi SOLO con un array JSON di massimo 4 oggetti con questi campi, in italiano:
+- name, producer, region, vintage, price, currency
+- reason: motivazione breve (massimo 2 frasi), in italiano, colloquiale ma competente
+
+Nessun testo fuori dal JSON, niente blocchi markdown.`;
+  }
+
+  // ---------- rendering ----------
+
+  function iconSvg(name) {
+    const icons = {
+      wine: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 22h8"/><path d="M7 10h10"/><path d="M12 15v7"/><path d="M12 15a5 5 0 0 0 5-5c0-2-1.5-2-1.5-3S17 5.5 17 3.5c0-.5-.5-1.5-1.5-1.5h-7C7.5 2 7 3 7 3.5 7 5.5 8.5 5.5 8.5 7c0 1-1.5 1-1.5 3a5 5 0 0 0 5 5Z"/></svg>',
+      upload: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M12 12v9"/><path d="m16 16-4-4-4 4"/></svg>',
+      sliders: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" x2="4" y1="21" y2="14"/><line x1="4" x2="4" y1="10" y2="3"/><line x1="12" x2="12" y1="21" y2="12"/><line x1="12" x2="12" y1="8" y2="3"/><line x1="20" x2="20" y1="21" y2="16"/><line x1="20" x2="20" y1="12" y2="3"/><line x1="2" x2="6" y1="14" y2="14"/><line x1="10" x2="14" y1="8" y2="8"/><line x1="18" x2="22" y1="16" y2="16"/></svg>',
+      sparkles: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/></svg>',
+      loader: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>',
+      x: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>',
+      file: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>',
+      image: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg>',
+      reset: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>',
+      settings: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>',
+    };
+    return icons[name] || "";
+  }
+
+  function render() {
+    const root = document.getElementById("wsl-root");
+    const s = state;
+    const detectedCurrency = s.parsedWines ? mostCommonCurrency(s.parsedWines) : "";
+    const availableTypes = s.parsedWines
+      ? Array.from(new Set(s.parsedWines.map((w) => w.type).filter(Boolean)))
+      : [];
+
+    root.innerHTML = `
+      <div class="wsl-header">
+        ${iconSvg("wine")}
+        <div>
+          <h1>Sommelier di carta</h1>
+          <div class="wsl-sub">analisi lista vini &middot; consigli su misura</div>
+        </div>
+        <div class="wsl-header-actions">
+          ${(s.parsedWines || s.rawText || s.files.length > 0)
+            ? `<button class="wsl-icon-btn" id="btn-reset">${iconSvg("reset")} Ricomincia</button>`
+            : ""}
+          <button class="wsl-icon-btn" id="btn-settings">${iconSvg("settings")} Chiave API</button>
+        </div>
+      </div>
+
+      <div class="wsl-body">
+        <div class="wsl-input-panel">
+          <div class="wsl-label">${iconSvg("file")} Testo della carta</div>
+          <textarea class="wsl-textarea" id="raw-text" placeholder="Incolla qui il testo della carta vini...">${escapeHtml(s.rawText)}</textarea>
+
+          <div class="wsl-upload-zone" id="upload-zone">
+            ${iconSvg("upload")}
+            <div>Carica foto o PDF della carta</div>
+            <input type="file" id="file-input" accept="image/*,application/pdf" multiple style="display:none" />
+          </div>
+
+          ${s.files.length > 0 ? `
+            <div class="wsl-file-list">
+              ${s.files.map((f) => `
+                <div class="wsl-file-chip" data-id="${f.id}">
+                  ${f.kind === "pdf" ? iconSvg("file") : iconSvg("image")}
+                  <span>${escapeHtml(f.name)}</span>
+                  <button class="btn-remove-file" data-id="${f.id}">${iconSvg("x")}</button>
+                </div>
+              `).join("")}
+            </div>
+          ` : ""}
+
+          <button class="wsl-btn primary" id="btn-analyze" ${s.parsing ? "disabled" : ""}>
+            ${s.parsing
+              ? `<span class="wsl-spin">${iconSvg("loader")}</span> Sto leggendo la carta...`
+              : `${iconSvg("sparkles")} Analizza carta`}
+          </button>
+
+          ${s.parseError ? `<div class="wsl-error">${escapeHtml(s.parseError)}</div>` : ""}
+
+          ${s.parsedWines ? `
+            <div class="wsl-summary">
+              Trovati <strong>${s.parsedWines.length}</strong> vini
+              ${detectedCurrency ? ` &middot; valuta rilevata <strong>${detectedCurrency}</strong>` : ""}
+              <div class="wsl-chips">
+                ${availableTypes.map((t) => `<span class="wsl-chip">${TYPE_LABELS[t] || t} &middot; ${s.parsedWines.filter((w) => w.type === t).length}</span>`).join("")}
+              </div>
+            </div>
+
+            <div class="wsl-filters">
+              <div class="wsl-label">${iconSvg("sliders")} Cosa cerchi</div>
+
+              <div class="wsl-field">
+                <label>Budget massimo per bottiglia ${detectedCurrency ? `(${detectedCurrency})` : ""}</label>
+                <input type="number" class="wsl-number-input" id="budget-input" value="${s.budget}" min="0" />
+              </div>
+
+              <div class="wsl-field">
+                <label>Tipologia</label>
+                <div class="wsl-pill-row" id="color-pills">
+                  <button class="wsl-pill ${s.colorPref === "tutti" ? "active" : ""}" data-color="tutti">Tutti</button>
+                  ${availableTypes.map((t) => `<button class="wsl-pill ${s.colorPref === t ? "active" : ""}" data-color="${t}">${TYPE_LABELS[t] || t}</button>`).join("")}
+                </div>
+              </div>
+
+              <div class="wsl-field">
+                <label>Stile</label>
+                <div class="wsl-pill-row" id="style-pills">
+                  ${["tutti", "naturale", "classico"].map((st) => `<button class="wsl-pill ${s.stylePref === st ? "active" : ""}" data-style="${st}">${st === "tutti" ? "Nessuna preferenza" : st.charAt(0).toUpperCase() + st.slice(1)}</button>`).join("")}
+                </div>
+              </div>
+
+              <button class="wsl-btn gold" id="btn-recommend" ${s.recommending ? "disabled" : ""}>
+                ${s.recommending
+                  ? `<span class="wsl-spin">${iconSvg("loader")}</span> Scelgo le proposte...`
+                  : `${iconSvg("wine")} Consigliami 4 vini`}
+              </button>
+              ${s.recError ? `<div class="wsl-error">${escapeHtml(s.recError)}</div>` : ""}
+            </div>
+          ` : ""}
+        </div>
+
+        <div class="wsl-results-panel">
+          ${!s.recommendations ? `
+            <div class="wsl-empty-state">
+              <div class="wsl-icon-wrap">${iconSvg("wine")}</div>
+              ${s.parsedWines
+                ? "Imposta budget, tipologia e stile, poi chiedi le 4 proposte."
+                : "Incolla o carica una carta vini per iniziare."}
+            </div>
+          ` : (s.recommendations.length > 0 ? `
+            <div class="wsl-cards">
+              ${s.recommendations.map((r, i) => `
+                <div class="wsl-card">
+                  <div class="wsl-card-index">${String(i + 1).padStart(2, "0")}</div>
+                  <div class="wsl-card-name">${escapeHtml(r.name || "")}</div>
+                  <div class="wsl-card-producer">${escapeHtml(r.producer || "")}</div>
+                  <div class="wsl-card-meta">
+                    ${r.region ? `<span>regione <b>${escapeHtml(r.region)}</b></span>` : ""}
+                    ${r.vintage ? `<span>annata <b>${escapeHtml(String(r.vintage))}</b></span>` : ""}
+                    ${r.price != null ? `<span>prezzo <b>${escapeHtml(String(r.price))}${r.currency ? " " + escapeHtml(r.currency) : ""}</b></span>` : ""}
+                  </div>
+                  <div class="wsl-card-reason">${escapeHtml(r.reason || "")}</div>
+                </div>
+              `).join("")}
+            </div>
+          ` : `<div class="wsl-empty-state">Nessuna proposta trovata con questi criteri.</div>`)}
+        </div>
+      </div>
+
+      ${s.showSettings ? `
+        <div class="wsl-modal-backdrop" id="settings-backdrop">
+          <div class="wsl-modal">
+            <h2>Chiave API Anthropic</h2>
+            <p>L'app gira come sito/app standalone e chiama direttamente l'API di Anthropic dal tuo dispositivo: serve una tua chiave API personale (creata su console.anthropic.com). Viene salvata solo in locale sul telefono.</p>
+            <input type="password" id="api-key-input" placeholder="sk-ant-..." value="${escapeHtml(s.settings.apiKey)}" />
+            <p style="margin-top:-6px;">Modello (facoltativo, default claude-sonnet-5):</p>
+            <input type="text" id="model-input" placeholder="claude-sonnet-5" value="${escapeHtml(s.settings.model)}" />
+            <div class="wsl-modal-actions">
+              <button class="cancel" id="settings-cancel">Annulla</button>
+              <button class="save" id="settings-save">Salva</button>
+            </div>
+          </div>
+        </div>
+      ` : ""}
+    `;
+
+    attachListeners();
+  }
+
+  function escapeHtml(str) {
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function attachListeners() {
+    const $ = (sel) => document.querySelector(sel);
+    const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+
+    const rawTextEl = $("#raw-text");
+    if (rawTextEl) rawTextEl.addEventListener("input", (e) => { state.rawText = e.target.value; });
+
+    const uploadZone = $("#upload-zone");
+    const fileInput = $("#file-input");
+    if (uploadZone && fileInput) {
+      uploadZone.addEventListener("click", () => fileInput.click());
+      fileInput.addEventListener("change", handleFilesSelected);
+    }
+
+    $$(".btn-remove-file").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        const id = e.currentTarget.getAttribute("data-id");
+        state.files = state.files.filter((f) => f.id !== id);
+        render();
+      });
+    });
+
+    const analyzeBtn = $("#btn-analyze");
+    if (analyzeBtn) analyzeBtn.addEventListener("click", handleAnalyze);
+
+    const recommendBtn = $("#btn-recommend");
+    if (recommendBtn) recommendBtn.addEventListener("click", handleRecommend);
+
+    const resetBtn = $("#btn-reset");
+    if (resetBtn) resetBtn.addEventListener("click", resetAll);
+
+    const settingsBtn = $("#btn-settings");
+    if (settingsBtn) settingsBtn.addEventListener("click", () => { state.showSettings = true; render(); });
+
+    const budgetInput = $("#budget-input");
+    if (budgetInput) budgetInput.addEventListener("input", (e) => { state.budget = e.target.value; });
+
+    $$("#color-pills .wsl-pill").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        state.colorPref = e.currentTarget.getAttribute("data-color");
+        render();
+      });
+    });
+    $$("#style-pills .wsl-pill").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        state.stylePref = e.currentTarget.getAttribute("data-style");
+        render();
+      });
+    });
+
+    const settingsCancel = $("#settings-cancel");
+    if (settingsCancel) settingsCancel.addEventListener("click", () => { state.showSettings = false; render(); });
+    const settingsSave = $("#settings-save");
+    if (settingsSave) settingsSave.addEventListener("click", () => {
+      const apiKey = $("#api-key-input").value.trim();
+      const model = $("#model-input").value.trim() || "claude-sonnet-5";
+      state.settings = { apiKey, model };
+      saveSettings(state.settings);
+      state.showSettings = false;
+      render();
+    });
+    const backdrop = $("#settings-backdrop");
+    if (backdrop) backdrop.addEventListener("click", (e) => {
+      if (e.target === backdrop) { state.showSettings = false; render(); }
+    });
+  }
+
+  async function handleFilesSelected(e) {
+    const selected = Array.from(e.target.files || []);
+    for (const file of selected) {
+      const isPdf = file.type === "application/pdf";
+      const isImage = file.type.startsWith("image/");
+      if (!isPdf && !isImage) continue;
+      try {
+        const base64 = await readFileAsBase64(file);
+        state.files.push({
+          id: Date.now() + "-" + Math.random().toString(36).slice(2),
+          name: file.name,
+          kind: isPdf ? "pdf" : "image",
+          mediaType: file.type,
+          base64,
+        });
+      } catch (err) {
+        state.parseError = "Errore leggendo " + file.name;
+      }
+    }
+    render();
+  }
+
+  function resetAll() {
+    state.rawText = "";
+    state.files = [];
+    state.parsedWines = null;
+    state.parseError = "";
+    state.recommendations = null;
+    state.recError = "";
+    render();
+  }
+
+  async function handleAnalyze() {
+    state.parseError = "";
+    state.recommendations = null;
+    if (!state.rawText.trim() && state.files.length === 0) {
+      state.parseError = "Incolla del testo o carica almeno un'immagine/PDF della carta.";
+      render();
+      return;
+    }
+    state.parsing = true;
+    render();
+    try {
+      const content = [];
+      if (state.rawText.trim()) {
+        content.push({ type: "text", text: "Testo della carta vini incollato dall'utente:\n" + state.rawText });
+      }
+      state.files.forEach((f) => {
+        if (f.kind === "pdf") {
+          content.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: f.base64 } });
+        } else {
+          content.push({ type: "image", source: { type: "base64", media_type: f.mediaType, data: f.base64 } });
+        }
+      });
+      content.push({ type: "text", text: PARSE_INSTRUCTIONS });
+
+      const result = await callClaude(content, 8000);
+      const parsed = parseJsonSafe(result);
+      if (!Array.isArray(parsed) || parsed.length === 0) {
+        throw new Error("Non ho trovato vini leggibili in questa carta.");
+      }
+      state.parsedWines = parsed;
+    } catch (err) {
+      state.parseError = err.message || "Errore durante l'analisi.";
+    } finally {
+      state.parsing = false;
+      render();
+    }
+  }
+
+  async function handleRecommend() {
+    if (!state.parsedWines) return;
+    state.recError = "";
+    state.recommending = true;
+    render();
+    try {
+      const currency = mostCommonCurrency(state.parsedWines);
+      let candidates = state.parsedWines.filter((w) => {
+        const withinBudget = w.price == null || Number(w.price) <= Number(state.budget);
+        const colorOk = state.colorPref === "tutti" || w.type === state.colorPref;
+        const styleOk = state.stylePref === "tutti" || (w.style && String(w.style).toLowerCase().includes(state.stylePref));
+        return withinBudget && colorOk && styleOk;
+      });
+
+      let fallbackUsed = false;
+      if (candidates.length === 0) {
+        fallbackUsed = true;
+        candidates = state.parsedWines.filter((w) => w.price == null || Number(w.price) <= Number(state.budget));
+      }
+      if (candidates.length === 0) {
+        candidates = state.parsedWines;
+        fallbackUsed = true;
+      }
+
+      const trimmed = candidates.slice(0, 200);
+      const instructions = buildRecommendInstructions({
+        budget: state.budget, currency, colorPref: state.colorPref, stylePref: state.stylePref, fallbackUsed,
+      });
+
+      const content = [{ type: "text", text: "Elenco vini candidati (JSON):\n" + JSON.stringify(trimmed) + "\n\n" + instructions }];
+      const result = await callClaude(content, 2000);
+      const parsed = parseJsonSafe(result);
+      state.recommendations = Array.isArray(parsed) ? parsed.slice(0, 4) : [];
+    } catch (err) {
+      state.recError = err.message || "Errore durante la generazione dei consigli.";
+    } finally {
+      state.recommending = false;
+      render();
+    }
+  }
+
+  render();
+})();
