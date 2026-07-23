@@ -38,6 +38,7 @@
     rawText: "",
     files: [], // {id, name, kind, mediaType, base64, sizeMB}
     filesProcessing: false,
+    filesProcessingProgress: "",
     parsing: false,
     parsingProgress: "",
     parseError: "",
@@ -45,12 +46,14 @@
     budget: 1000,
     colorPref: "tutti",
     stylePref: "tutti",
+    countryPref: "tutte",
     recommending: false,
     recError: "",
     recommendations: null,
   };
 
-  const CHUNK_SIZE = 8; // pagine/immagini inviate per ogni chiamata, per non fare un'unica richiesta enorme
+  const CHUNK_SIZE = 4; // pagine/immagini inviate per ogni chiamata: più piccolo = più affidabile su reti deboli
+  const MAX_RETRIES_PER_CHUNK = 2;
 
   if (window.pdfjsLib) {
     pdfjsLib.GlobalWorkerOptions.workerSrc = "https://unpkg.com/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
@@ -115,19 +118,21 @@
     });
   }
 
-  async function pdfFileToImageEntries(file, maxDim, quality) {
+  async function pdfFileToImageEntries(file, maxDim, quality, onProgress) {
     const arrayBuffer = await file.arrayBuffer();
     const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
     const entries = [];
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
     for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+      if (onProgress) onProgress(pageNum, pdf.numPages);
       const page = await pdf.getPage(pageNum);
       const baseViewport = page.getViewport({ scale: 1 });
-      const scale = Math.max(0.3, Math.min(maxDim / baseViewport.width, maxDim / baseViewport.height));
+      const scale = Math.max(0.25, Math.min(maxDim / baseViewport.width, maxDim / baseViewport.height));
       const viewport = page.getViewport({ scale });
-      const canvas = document.createElement("canvas");
       canvas.width = Math.round(viewport.width);
       canvas.height = Math.round(viewport.height);
-      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
       await page.render({ canvasContext: ctx, viewport }).promise;
       const dataUrl = canvas.toDataURL("image/jpeg", quality);
       const base64 = dataUrl.split(",")[1];
@@ -139,7 +144,13 @@
         base64,
         sizeMB: (base64.length * 0.75) / (1024 * 1024),
       });
+      // Libera la memoria della pagina renderizzata prima di passare alla successiva:
+      // essenziale su telefono con PDF lunghi, altrimenti il browser può saturare la RAM.
+      page.cleanup();
     }
+    // Riusa un solo canvas per tutte le pagine invece di crearne uno nuovo ogni volta.
+    canvas.width = 0;
+    canvas.height = 0;
     return entries;
   }
 
@@ -182,6 +193,7 @@ Estrai OGNI vino/bottiglia che riesci a identificare come un oggetto con questi 
 - name: nome della cuvee/etichetta (senza produttore, senza annata)
 - producer: nome del produttore/cantina
 - region: regione o denominazione (se nota, altrimenti stringa vuota)
+- country: nazione di origine, dedotta dalla regione/denominazione/produttore (es. "Italia", "Francia", "Spagna", "Germania", "Portogallo", "Stati Uniti", "Cile", "Argentina", "Sudafrica", "Australia", "Nuova Zelanda", "Austria", "Ungheria", "Slovenia", ecc.), stringa vuota se non deducibile con ragionevole certezza
 - vintage: annata come numero, o null se non millesimato
 - type: uno tra "rosso", "bianco", "champagne", "rosato", "orange", "dolce", "altro" (usa "orange" per i vini macerati/orange wine, ottenuti da uve bianche vinificate con le bucce)
 - price: prezzo come numero (solo cifre), o null se assente
@@ -191,17 +203,18 @@ Estrai OGNI vino/bottiglia che riesci a identificare come un oggetto con questi 
 
 Rispondi SOLO con un array JSON valido di questi oggetti, senza testo introduttivo, senza commenti, senza blocchi markdown.`;
 
-  function buildRecommendInstructions({ budget, currency, colorPref, stylePref, fallbackUsed }) {
+  function buildRecommendInstructions({ budget, currency, colorPref, stylePref, countryPref, fallbackUsed }) {
     return `Sei un sommelier. Ti fornisco un elenco di vini candidati (in JSON) gia' pre-filtrato da un budget massimo di ${budget}${currency ? " " + currency : ""} per bottiglia.
 
 Preferenza di colore/tipologia richiesta: ${colorPref === "tutti" ? "nessuna, va bene qualsiasi tipologia" : (TYPE_LABELS[colorPref] || colorPref)}.
 Preferenza di stile richiesta: ${stylePref === "tutti" ? "nessuna preferenza particolare" : stylePref}.
-${fallbackUsed ? "Nota: nessun vino rispettava esattamente colore/stile richiesti entro budget, quindi ti sto passando i migliori candidati solo filtrati per budget: rilassa i criteri secondari ma spiegalo brevemente nella motivazione." : ""}
+Preferenza di nazione richiesta: ${!countryPref || countryPref === "tutte" ? "nessuna preferenza particolare" : countryPref}.
+${fallbackUsed ? "Nota: nessun vino rispettava esattamente colore/stile/nazione richiesti entro budget, quindi ti sto passando i migliori candidati solo filtrati per budget: rilassa i criteri secondari ma spiegalo brevemente nella motivazione." : ""}
 
-Scegli le 4 proposte migliori (o meno di 4 se i candidati sono meno di 4), privilegiando a parita' di merito i produttori piccoli/indipendenti e le etichette meno scontate rispetto ai nomi piu' commerciali, e cercando di variare regione/stile tra le proposte quando possibile.
+Scegli le 3 proposte migliori (o meno di 3 se i candidati sono meno di 3), privilegiando a parita' di merito i produttori piccoli/indipendenti e le etichette meno scontate rispetto ai nomi piu' commerciali, e cercando di variare regione/stile tra le proposte quando possibile.
 
-Rispondi SOLO con un array JSON di massimo 4 oggetti con questi campi, in italiano:
-- name, producer, region, vintage, price, currency
+Rispondi SOLO con un array JSON di massimo 3 oggetti con questi campi, in italiano:
+- name, producer, region, country, vintage, price, currency
 - reason: motivazione breve (massimo 2 frasi), in italiano, colloquiale ma competente
 
 Nessun testo fuori dal JSON, niente blocchi markdown.`;
@@ -232,6 +245,9 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
     const availableTypes = s.parsedWines
       ? Array.from(new Set(s.parsedWines.map((w) => w.type).filter(Boolean)))
       : [];
+    const availableCountries = s.parsedWines
+      ? Array.from(new Set(s.parsedWines.map((w) => w.country).filter(Boolean))).sort()
+      : [];
 
     root.innerHTML = `
       <div class="wsl-header">
@@ -255,7 +271,7 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
 
           <div class="wsl-upload-zone" id="upload-zone">
             ${s.filesProcessing
-              ? `<span class="wsl-spin">${iconSvg("loader")}</span><div>Elaborazione pagine...</div>`
+              ? `<span class="wsl-spin">${iconSvg("loader")}</span><div>${s.filesProcessingProgress || "Elaborazione pagine..."}</div>`
               : `${iconSvg("upload")}<div>Carica foto o PDF della carta</div>`}
             <input type="file" id="file-input" accept="image/*,application/pdf" multiple style="display:none" ${s.filesProcessing ? "disabled" : ""} />
           </div>
@@ -312,10 +328,20 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
                 </div>
               </div>
 
+              <div class="wsl-field">
+                <label>Nazione</label>
+                ${availableCountries.length > 0 ? `
+                  <select class="wsl-number-input" id="country-select">
+                    <option value="tutte" ${s.countryPref === "tutte" ? "selected" : ""}>Tutte</option>
+                    ${availableCountries.map((c) => `<option value="${escapeHtml(c)}" ${s.countryPref === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
+                  </select>
+                ` : `<div style="font-size:11.5px;color:var(--muted);">Nazione non rilevabile da questa carta.</div>`}
+              </div>
+
               <button class="wsl-btn gold" id="btn-recommend" ${s.recommending ? "disabled" : ""}>
                 ${s.recommending
                   ? `<span class="wsl-spin">${iconSvg("loader")}</span> Scelgo le proposte...`
-                  : `${iconSvg("wine")} Consigliami 4 vini`}
+                  : `${iconSvg("wine")} Consigliami 3 vini`}
               </button>
               ${s.recError ? `<div class="wsl-error">${escapeHtml(s.recError)}</div>` : ""}
             </div>
@@ -327,7 +353,7 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
             <div class="wsl-empty-state">
               <div class="wsl-icon-wrap">${iconSvg("wine")}</div>
               ${s.parsedWines
-                ? "Imposta budget, tipologia e stile, poi chiedi le 4 proposte."
+                ? "Imposta budget, tipologia e stile, poi chiedi le 3 proposte."
                 : "Incolla o carica una carta vini per iniziare."}
             </div>
           ` : (s.recommendations.length > 0 ? `
@@ -339,6 +365,7 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
                   <div class="wsl-card-producer">${escapeHtml(r.producer || "")}</div>
                   <div class="wsl-card-meta">
                     ${r.region ? `<span>regione <b>${escapeHtml(r.region)}</b></span>` : ""}
+                    ${r.country ? `<span>nazione <b>${escapeHtml(r.country)}</b></span>` : ""}
                     ${r.vintage ? `<span>annata <b>${escapeHtml(String(r.vintage))}</b></span>` : ""}
                     ${r.price != null ? `<span>prezzo <b>${escapeHtml(String(r.price))}${r.currency ? " " + escapeHtml(r.currency) : ""}</b></span>` : ""}
                   </div>
@@ -428,6 +455,9 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
       });
     });
 
+    const countrySelect = $("#country-select");
+    if (countrySelect) countrySelect.addEventListener("change", (e) => { state.countryPref = e.target.value; });
+
     const settingsCancel = $("#settings-cancel");
     if (settingsCancel) settingsCancel.addEventListener("click", () => { state.showSettings = false; render(); });
     const settingsSave = $("#settings-save");
@@ -457,8 +487,12 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
       if (!isPdf && !isImage) continue;
       try {
         if (isPdf && window.pdfjsLib) {
-          const entries = await pdfFileToImageEntries(file, 1500, 0.72);
+          const entries = await pdfFileToImageEntries(file, 1300, 0.62, (pageNum, total) => {
+            state.filesProcessingProgress = "Pagina " + pageNum + "/" + total + " di " + file.name;
+            render();
+          });
           state.files.push(...entries);
+          state.filesProcessingProgress = "";
         } else if (isPdf) {
           // fallback se pdf.js non si carica (es. offline): invia il PDF grezzo, meno affidabile su reti deboli
           const base64 = await readFileAsBase64(file);
@@ -486,6 +520,7 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
       }
     }
     state.filesProcessing = false;
+    state.filesProcessingProgress = "";
     render();
   }
 
@@ -496,6 +531,9 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
     state.parseError = "";
     state.recommendations = null;
     state.recError = "";
+    state.colorPref = "tutti";
+    state.stylePref = "tutti";
+    state.countryPref = "tutte";
     render();
   }
 
@@ -523,13 +561,11 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
         if (Array.isArray(parsed)) allWines.push(...parsed);
       } else {
         const totalChunks = Math.ceil(state.files.length / CHUNK_SIZE);
+        const failedChunks = [];
         for (let i = 0; i < state.files.length; i += CHUNK_SIZE) {
           const chunkFiles = state.files.slice(i, i + CHUNK_SIZE);
           const chunkNum = Math.floor(i / CHUNK_SIZE) + 1;
-          state.parsingProgress = totalChunks > 1
-            ? "Lotto " + chunkNum + "/" + totalChunks + " (pagine " + (i + 1) + "-" + Math.min(i + CHUNK_SIZE, state.files.length) + " di " + state.files.length + ")"
-            : "";
-          render();
+          const rangeLabel = "pagine " + (i + 1) + "-" + Math.min(i + CHUNK_SIZE, state.files.length) + " di " + state.files.length;
 
           const content = [];
           if (i === 0 && state.rawText.trim()) {
@@ -544,9 +580,42 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
           });
           content.push({ type: "text", text: PARSE_INSTRUCTIONS });
 
-          const result = await callClaude(content, 8000);
-          const parsed = parseJsonSafe(result);
-          if (Array.isArray(parsed)) allWines.push(...parsed);
+          // Riprova automaticamente un lotto che fallisce (tipico su reti mobili instabili)
+          // invece di far fallire l'intera analisi per un singolo lotto sfortunato.
+          let lastErr = null;
+          let succeeded = false;
+          for (let attempt = 1; attempt <= MAX_RETRIES_PER_CHUNK + 1; attempt++) {
+            state.parsingProgress = totalChunks > 1
+              ? "Lotto " + chunkNum + "/" + totalChunks + " (" + rangeLabel + ")" + (attempt > 1 ? " · tentativo " + attempt : "")
+              : (attempt > 1 ? "Nuovo tentativo..." : "");
+            render();
+            try {
+              const result = await callClaude(content, 8000);
+              const parsed = parseJsonSafe(result);
+              if (Array.isArray(parsed)) allWines.push(...parsed);
+              succeeded = true;
+              break;
+            } catch (err) {
+              lastErr = err;
+              if (attempt <= MAX_RETRIES_PER_CHUNK) {
+                await new Promise((r) => setTimeout(r, 1200 * attempt));
+              }
+            }
+          }
+          if (!succeeded) {
+            failedChunks.push({ rangeLabel, error: lastErr });
+          }
+        }
+
+        if (failedChunks.length > 0 && allWines.length > 0) {
+          // Risultato parziale: meglio mostrare quello che si è riusciti a leggere
+          // che perdere tutto per un lotto che continua a fallire.
+          state.parseError =
+            "Alcune pagine non sono state lette dopo vari tentativi (" +
+            failedChunks.map((f) => f.rangeLabel).join("; ") +
+            "): l'analisi qui sotto è basata solo sulle pagine lette con successo. Puoi riprovare, magari con una connessione più stabile.";
+        } else if (failedChunks.length > 0 && allWines.length === 0) {
+          throw failedChunks[0].error || new Error("Errore durante l'analisi.");
         }
       }
 
@@ -584,7 +653,8 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
         const withinBudget = w.price == null || Number(w.price) <= Number(state.budget);
         const colorOk = state.colorPref === "tutti" || w.type === state.colorPref;
         const styleOk = state.stylePref === "tutti" || (w.style && String(w.style).toLowerCase().includes(state.stylePref));
-        return withinBudget && colorOk && styleOk;
+        const countryOk = !state.countryPref || state.countryPref === "tutte" || w.country === state.countryPref;
+        return withinBudget && colorOk && styleOk && countryOk;
       });
 
       let fallbackUsed = false;
@@ -599,13 +669,13 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
 
       const trimmed = candidates.slice(0, 200);
       const instructions = buildRecommendInstructions({
-        budget: state.budget, currency, colorPref: state.colorPref, stylePref: state.stylePref, fallbackUsed,
+        budget: state.budget, currency, colorPref: state.colorPref, stylePref: state.stylePref, countryPref: state.countryPref, fallbackUsed,
       });
 
       const content = [{ type: "text", text: "Elenco vini candidati (JSON):\n" + JSON.stringify(trimmed) + "\n\n" + instructions }];
       const result = await callClaude(content, 2000);
       const parsed = parseJsonSafe(result);
-      state.recommendations = Array.isArray(parsed) ? parsed.slice(0, 4) : [];
+      state.recommendations = Array.isArray(parsed) ? parsed.slice(0, 3) : [];
     } catch (err) {
       state.recError = err.message || "Errore durante la generazione dei consigli.";
     } finally {
