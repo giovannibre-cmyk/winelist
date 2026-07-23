@@ -6,9 +6,14 @@
     bianco: "Bianco",
     champagne: "Champagne / Bollicine",
     rosato: "Rosato",
+    orange: "Orange",
     dolce: "Dolce",
     altro: "Altro",
   };
+
+  // Ordine fisso delle tipologie sempre selezionabili come filtro,
+  // indipendentemente da quali siano effettivamente presenti nella carta caricata.
+  const FIXED_TYPES = ["rosso", "bianco", "rosato", "orange", "champagne", "dolce"];
 
   const SETTINGS_KEY = "sommelier_settings_v1";
 
@@ -31,8 +36,10 @@
     settings: loadSettings(),
     showSettings: false,
     rawText: "",
-    files: [], // {id, name, kind, mediaType, base64}
+    files: [], // {id, name, kind, mediaType, base64, sizeMB}
+    filesProcessing: false,
     parsing: false,
+    parsingProgress: "",
     parseError: "",
     parsedWines: null,
     budget: 1000,
@@ -42,6 +49,12 @@
     recError: "",
     recommendations: null,
   };
+
+  const CHUNK_SIZE = 8; // pagine/immagini inviate per ogni chiamata, per non fare un'unica richiesta enorme
+
+  if (window.pdfjsLib) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://unpkg.com/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
+  }
 
   function mostCommonCurrency(wines) {
     const counts = {};
@@ -77,24 +90,84 @@
     });
   }
 
+  function downscaleImageFile(file, maxDim, quality) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const img = new Image();
+        img.onload = () => {
+          const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+          const w = Math.max(1, Math.round(img.width * scale));
+          const h = Math.max(1, Math.round(img.height * scale));
+          const canvas = document.createElement("canvas");
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0, w, h);
+          const dataUrl = canvas.toDataURL("image/jpeg", quality);
+          resolve(dataUrl.split(",")[1]);
+        };
+        img.onerror = () => reject(new Error("Immagine non leggibile"));
+        img.src = reader.result;
+      };
+      reader.onerror = () => reject(new Error("Lettura file fallita"));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function pdfFileToImageEntries(file, maxDim, quality) {
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    const entries = [];
+    for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+      const page = await pdf.getPage(pageNum);
+      const baseViewport = page.getViewport({ scale: 1 });
+      const scale = Math.max(0.3, Math.min(maxDim / baseViewport.width, maxDim / baseViewport.height));
+      const viewport = page.getViewport({ scale });
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(viewport.width);
+      canvas.height = Math.round(viewport.height);
+      const ctx = canvas.getContext("2d");
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      const dataUrl = canvas.toDataURL("image/jpeg", quality);
+      const base64 = dataUrl.split(",")[1];
+      entries.push({
+        id: Date.now() + "-" + pageNum + "-" + Math.random().toString(36).slice(2),
+        name: file.name + " · pag. " + pageNum + "/" + pdf.numPages,
+        kind: "image",
+        mediaType: "image/jpeg",
+        base64,
+        sizeMB: (base64.length * 0.75) / (1024 * 1024),
+      });
+    }
+    return entries;
+  }
+
   async function callClaude(content, maxTokens) {
     if (!state.settings.apiKey) {
       throw new Error("Aggiungi la tua chiave API Anthropic nelle impostazioni (icona ingranaggio) prima di continuare.");
     }
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": state.settings.apiKey,
-        "anthropic-version": "2023-06-01",
-        "anthropic-dangerous-direct-browser-access": "true",
-      },
-      body: JSON.stringify({
-        model: state.settings.model || "claude-sonnet-5",
-        max_tokens: maxTokens,
-        messages: [{ role: "user", content }],
-      }),
-    });
+    let res;
+    try {
+      res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": state.settings.apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: state.settings.model || "claude-sonnet-5",
+          max_tokens: maxTokens,
+          messages: [{ role: "user", content }],
+        }),
+      });
+    } catch (networkErr) {
+      throw new Error(
+        "La richiesta non è arrivata a destinazione (connessione instabile o file troppo pesante per la rete attuale). Prova a: 1) passare al Wi-Fi se sei sui dati mobili (o viceversa), 2) riprovare, 3) se il PDF ha molte pagine scansionate ad alta risoluzione, provare con meno pagine per volta."
+      );
+    }
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
       throw new Error("Errore API (" + res.status + "): " + errText.slice(0, 200));
@@ -110,7 +183,7 @@ Estrai OGNI vino/bottiglia che riesci a identificare come un oggetto con questi 
 - producer: nome del produttore/cantina
 - region: regione o denominazione (se nota, altrimenti stringa vuota)
 - vintage: annata come numero, o null se non millesimato
-- type: uno tra "rosso", "bianco", "champagne", "rosato", "dolce", "altro"
+- type: uno tra "rosso", "bianco", "champagne", "rosato", "orange", "dolce", "altro" (usa "orange" per i vini macerati/orange wine, ottenuti da uve bianche vinificate con le bucce)
 - price: prezzo come numero (solo cifre), o null se assente
 - currency: valuta stimata come sigla (es. "DKK", "EUR", "CHF"), stringa vuota se ignota
 - style: se deducibile, uno tra "naturale", "biodinamico", "classico" o null
@@ -181,9 +254,10 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
           <textarea class="wsl-textarea" id="raw-text" placeholder="Incolla qui il testo della carta vini...">${escapeHtml(s.rawText)}</textarea>
 
           <div class="wsl-upload-zone" id="upload-zone">
-            ${iconSvg("upload")}
-            <div>Carica foto o PDF della carta</div>
-            <input type="file" id="file-input" accept="image/*,application/pdf" multiple style="display:none" />
+            ${s.filesProcessing
+              ? `<span class="wsl-spin">${iconSvg("loader")}</span><div>Elaborazione pagine...</div>`
+              : `${iconSvg("upload")}<div>Carica foto o PDF della carta</div>`}
+            <input type="file" id="file-input" accept="image/*,application/pdf" multiple style="display:none" ${s.filesProcessing ? "disabled" : ""} />
           </div>
 
           ${s.files.length > 0 ? `
@@ -191,16 +265,16 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
               ${s.files.map((f) => `
                 <div class="wsl-file-chip" data-id="${f.id}">
                   ${f.kind === "pdf" ? iconSvg("file") : iconSvg("image")}
-                  <span>${escapeHtml(f.name)}</span>
+                  <span>${escapeHtml(f.name)}${f.sizeMB ? " · " + f.sizeMB.toFixed(1) + " MB" : ""}</span>
                   <button class="btn-remove-file" data-id="${f.id}">${iconSvg("x")}</button>
                 </div>
               `).join("")}
             </div>
           ` : ""}
 
-          <button class="wsl-btn primary" id="btn-analyze" ${s.parsing ? "disabled" : ""}>
+          <button class="wsl-btn primary" id="btn-analyze" ${s.parsing || s.filesProcessing ? "disabled" : ""}>
             ${s.parsing
-              ? `<span class="wsl-spin">${iconSvg("loader")}</span> Sto leggendo la carta...`
+              ? `<span class="wsl-spin">${iconSvg("loader")}</span> ${s.parsingProgress || "Sto leggendo la carta..."}`
               : `${iconSvg("sparkles")} Analizza carta`}
           </button>
 
@@ -227,7 +301,7 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
                 <label>Tipologia</label>
                 <div class="wsl-pill-row" id="color-pills">
                   <button class="wsl-pill ${s.colorPref === "tutti" ? "active" : ""}" data-color="tutti">Tutti</button>
-                  ${availableTypes.map((t) => `<button class="wsl-pill ${s.colorPref === t ? "active" : ""}" data-color="${t}">${TYPE_LABELS[t] || t}</button>`).join("")}
+                  ${FIXED_TYPES.map((t) => `<button class="wsl-pill ${s.colorPref === t ? "active" : ""}" data-color="${t}">${TYPE_LABELS[t] || t}</button>`).join("")}
                 </div>
               </div>
 
@@ -373,23 +447,45 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
 
   async function handleFilesSelected(e) {
     const selected = Array.from(e.target.files || []);
+    if (selected.length === 0) return;
+    state.parseError = "";
+    state.filesProcessing = true;
+    render();
     for (const file of selected) {
       const isPdf = file.type === "application/pdf";
       const isImage = file.type.startsWith("image/");
       if (!isPdf && !isImage) continue;
       try {
-        const base64 = await readFileAsBase64(file);
-        state.files.push({
-          id: Date.now() + "-" + Math.random().toString(36).slice(2),
-          name: file.name,
-          kind: isPdf ? "pdf" : "image",
-          mediaType: file.type,
-          base64,
-        });
+        if (isPdf && window.pdfjsLib) {
+          const entries = await pdfFileToImageEntries(file, 1500, 0.72);
+          state.files.push(...entries);
+        } else if (isPdf) {
+          // fallback se pdf.js non si carica (es. offline): invia il PDF grezzo, meno affidabile su reti deboli
+          const base64 = await readFileAsBase64(file);
+          state.files.push({
+            id: Date.now() + "-" + Math.random().toString(36).slice(2),
+            name: file.name,
+            kind: "pdf",
+            mediaType: file.type,
+            base64,
+            sizeMB: file.size / (1024 * 1024),
+          });
+        } else {
+          const base64 = await downscaleImageFile(file, 1800, 0.78);
+          state.files.push({
+            id: Date.now() + "-" + Math.random().toString(36).slice(2),
+            name: file.name,
+            kind: "image",
+            mediaType: "image/jpeg",
+            base64,
+            sizeMB: (base64.length * 0.75) / (1024 * 1024),
+          });
+        }
       } catch (err) {
-        state.parseError = "Errore leggendo " + file.name;
+        state.parseError = (err.message || "Errore leggendo " + file.name) + " (" + file.name + ")";
       }
     }
+    state.filesProcessing = false;
     render();
   }
 
@@ -412,31 +508,67 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
       return;
     }
     state.parsing = true;
+    state.parsingProgress = "";
     render();
     try {
-      const content = [];
-      if (state.rawText.trim()) {
-        content.push({ type: "text", text: "Testo della carta vini incollato dall'utente:\n" + state.rawText });
-      }
-      state.files.forEach((f) => {
-        if (f.kind === "pdf") {
-          content.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: f.base64 } });
-        } else {
-          content.push({ type: "image", source: { type: "base64", media_type: f.mediaType, data: f.base64 } });
-        }
-      });
-      content.push({ type: "text", text: PARSE_INSTRUCTIONS });
+      const allWines = [];
 
-      const result = await callClaude(content, 8000);
-      const parsed = parseJsonSafe(result);
-      if (!Array.isArray(parsed) || parsed.length === 0) {
+      if (state.files.length === 0) {
+        const content = [
+          { type: "text", text: "Testo della carta vini incollato dall'utente:\n" + state.rawText },
+          { type: "text", text: PARSE_INSTRUCTIONS },
+        ];
+        const result = await callClaude(content, 8000);
+        const parsed = parseJsonSafe(result);
+        if (Array.isArray(parsed)) allWines.push(...parsed);
+      } else {
+        const totalChunks = Math.ceil(state.files.length / CHUNK_SIZE);
+        for (let i = 0; i < state.files.length; i += CHUNK_SIZE) {
+          const chunkFiles = state.files.slice(i, i + CHUNK_SIZE);
+          const chunkNum = Math.floor(i / CHUNK_SIZE) + 1;
+          state.parsingProgress = totalChunks > 1
+            ? "Lotto " + chunkNum + "/" + totalChunks + " (pagine " + (i + 1) + "-" + Math.min(i + CHUNK_SIZE, state.files.length) + " di " + state.files.length + ")"
+            : "";
+          render();
+
+          const content = [];
+          if (i === 0 && state.rawText.trim()) {
+            content.push({ type: "text", text: "Testo della carta vini incollato dall'utente:\n" + state.rawText });
+          }
+          chunkFiles.forEach((f) => {
+            if (f.kind === "pdf") {
+              content.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: f.base64 } });
+            } else {
+              content.push({ type: "image", source: { type: "base64", media_type: f.mediaType, data: f.base64 } });
+            }
+          });
+          content.push({ type: "text", text: PARSE_INSTRUCTIONS });
+
+          const result = await callClaude(content, 8000);
+          const parsed = parseJsonSafe(result);
+          if (Array.isArray(parsed)) allWines.push(...parsed);
+        }
+      }
+
+      if (allWines.length === 0) {
         throw new Error("Non ho trovato vini leggibili in questa carta.");
       }
-      state.parsedWines = parsed;
+
+      // Deduplica in caso di vini ripetuti tra pagine/lotti sovrapposti
+      const seen = new Set();
+      const deduped = allWines.filter((w) => {
+        const key = [String(w.name || "").toLowerCase().trim(), String(w.producer || "").toLowerCase().trim(), w.vintage || ""].join("|");
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+
+      state.parsedWines = deduped;
     } catch (err) {
       state.parseError = err.message || "Errore durante l'analisi.";
     } finally {
       state.parsing = false;
+      state.parsingProgress = "";
       render();
     }
   }
