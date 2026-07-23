@@ -35,6 +35,8 @@
   const state = {
     settings: loadSettings(),
     showSettings: false,
+    testingConnection: false,
+    testResult: null,
     rawText: "",
     files: [], // {id, name, kind, mediaType, base64, sizeMB}
     filesProcessing: false,
@@ -200,7 +202,10 @@
       });
     } catch (networkErr) {
       throw new Error(
-        "La richiesta non è arrivata a destinazione (connessione instabile o file troppo pesante per la rete attuale). Prova a: 1) passare al Wi-Fi se sei sui dati mobili (o viceversa), 2) riprovare, 3) se il PDF ha molte pagine scansionate ad alta risoluzione, provare con meno pagine per volta."
+        "La richiesta non è arrivata a destinazione (connessione instabile o interrotta durante l'attesa della risposta). Prova a: 1) passare al Wi-Fi se sei sui dati mobili (o viceversa), 2) riprovare, 3) se il PDF ha molte pagine scansionate ad alta risoluzione, provare con meno pagine per volta. [dettaglio tecnico: " +
+        (networkErr && networkErr.name ? networkErr.name + ": " : "") +
+        (networkErr && networkErr.message ? networkErr.message : String(networkErr)) +
+        "]"
       );
     }
     if (!res.ok) {
@@ -409,6 +414,12 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
             <input type="password" id="api-key-input" placeholder="sk-ant-..." value="${escapeHtml(s.settings.apiKey)}" />
             <p style="margin-top:-6px;">Modello (facoltativo, default claude-sonnet-5):</p>
             <input type="text" id="model-input" placeholder="claude-sonnet-5" value="${escapeHtml(s.settings.model)}" />
+            <div class="wsl-modal-actions" style="justify-content: space-between; margin-bottom: 10px;">
+              <button class="cancel" id="test-connection" ${s.testingConnection ? "disabled" : ""}>
+                ${s.testingConnection ? "Test in corso..." : "Testa connessione"}
+              </button>
+            </div>
+            ${s.testResult ? `<p style="color:${s.testResult.ok ? "#9fd6a8" : "#e7a2a2"}; font-size:12px;">${escapeHtml(s.testResult.message)}</p>` : ""}
             <div class="wsl-modal-actions">
               <button class="cancel" id="settings-cancel">Annulla</button>
               <button class="save" id="settings-save">Salva</button>
@@ -484,6 +495,45 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
 
     const settingsCancel = $("#settings-cancel");
     if (settingsCancel) settingsCancel.addEventListener("click", () => { state.showSettings = false; render(); });
+
+    const testBtn = $("#test-connection");
+    if (testBtn) testBtn.addEventListener("click", async () => {
+      const apiKeyToTest = $("#api-key-input").value.trim();
+      state.testingConnection = true;
+      state.testResult = null;
+      render();
+      try {
+        if (!apiKeyToTest) throw new Error("Inserisci prima la chiave API qui sopra.");
+        const t0 = Date.now();
+        const res = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": apiKeyToTest,
+            "anthropic-version": "2023-06-01",
+            "anthropic-dangerous-direct-browser-access": "true",
+          },
+          body: JSON.stringify({
+            model: $("#model-input").value.trim() || "claude-sonnet-5",
+            max_tokens: 10,
+            messages: [{ role: "user", content: "rispondi solo con: ok" }],
+          }),
+        });
+        const ms = Date.now() - t0;
+        if (res.ok) {
+          state.testResult = { ok: true, message: "Connessione riuscita in " + ms + " ms: il dispositivo raggiunge l'API senza problemi. Se foto/PDF continuano a fallire, il problema è nel payload/nella logica dell'app, non nella rete." };
+        } else {
+          const errText = await res.text().catch(() => "");
+          state.testResult = { ok: false, message: "Il dispositivo raggiunge l'API (risposta ricevuta) ma con un errore (" + res.status + "): " + errText.slice(0, 150) };
+        }
+      } catch (err) {
+        state.testResult = { ok: false, message: "Richiesta non arrivata a destinazione: " + (err.message || "errore di rete") + ". Questo indica un blocco di rete (operatore, VPN, firewall) verso api.anthropic.com, non un problema di peso dei file." };
+      } finally {
+        state.testingConnection = false;
+        render();
+      }
+    });
+
     const settingsSave = $("#settings-save");
     if (settingsSave) settingsSave.addEventListener("click", () => {
       const apiKey = $("#api-key-input").value.trim();
