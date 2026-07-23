@@ -197,12 +197,13 @@
         body: JSON.stringify({
           model: state.settings.model || "claude-sonnet-5",
           max_tokens: maxTokens,
+          stream: true,
           messages: [{ role: "user", content }],
         }),
       });
     } catch (networkErr) {
       throw new Error(
-        "La richiesta non è arrivata a destinazione (connessione instabile o interrotta durante l'attesa della risposta). Prova a: 1) passare al Wi-Fi se sei sui dati mobili (o viceversa), 2) riprovare, 3) se il PDF ha molte pagine scansionate ad alta risoluzione, provare con meno pagine per volta. [dettaglio tecnico: " +
+        "La richiesta non è arrivata a destinazione (connessione instabile). Prova a: 1) passare al Wi-Fi se sei sui dati mobili (o viceversa), 2) riprovare. [dettaglio tecnico: " +
         (networkErr && networkErr.name ? networkErr.name + ": " : "") +
         (networkErr && networkErr.message ? networkErr.message : String(networkErr)) +
         "]"
@@ -212,8 +213,51 @@
       const errText = await res.text().catch(() => "");
       throw new Error("Errore API (" + res.status + "): " + errText.slice(0, 200));
     }
-    const data = await res.json();
-    return (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+
+    // Streaming: i dati arrivano a pezzi via Server-Sent Events invece che tutti insieme
+    // alla fine. Questo evita che una rete mobile "chiuda per inattività" una connessione
+    // che resta aperta a lungo mentre il modello genera risposte lunghe (liste dense di vini).
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+    let fullText = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data:")) continue;
+          const jsonStr = trimmed.slice(5).trim();
+          if (!jsonStr || jsonStr === "[DONE]") continue;
+          try {
+            const evt = JSON.parse(jsonStr);
+            if (evt.type === "content_block_delta" && evt.delta && evt.delta.type === "text_delta") {
+              fullText += evt.delta.text;
+            } else if (evt.type === "error") {
+              throw new Error(evt.error && evt.error.message ? evt.error.message : "Errore dal modello durante lo streaming.");
+            }
+          } catch (parseErr) {
+            // riga SSE incompleta/malformata: la ignoriamo e proseguiamo
+          }
+        }
+      }
+    } catch (streamErr) {
+      if (fullText) {
+        // Avevamo già ricevuto parte della risposta: proviamo comunque a usarla
+        // invece di buttare via tutto quello che era arrivato.
+        return fullText;
+      }
+      throw new Error(
+        "La connessione si è interrotta durante la ricezione della risposta. Riprova. [dettaglio tecnico: " +
+        (streamErr && streamErr.message ? streamErr.message : String(streamErr)) +
+        "]"
+      );
+    }
+    return fullText;
   }
 
   const PARSE_INSTRUCTIONS = `Analizza il contenuto sopra (testo incollato e/o immagini/PDF di una carta dei vini di ristorante). La carta puo' essere disordinata, scritta a mano, scansionata o organizzata per regioni.
