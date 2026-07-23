@@ -52,8 +52,32 @@
     recommendations: null,
   };
 
-  const CHUNK_SIZE = 4; // pagine/immagini inviate per ogni chiamata: più piccolo = più affidabile su reti deboli
+  const MAX_CHUNK_MB = 6; // peso massimo (approssimativo) di immagini per singola richiesta
+  const MAX_FILES_PER_CHUNK = 10; // tetto comunque presente per non fare pagine di testo enormi in un colpo solo
   const MAX_RETRIES_PER_CHUNK = 2;
+
+  // Raggruppa i file per peso reale invece che per numero fisso: una carta leggera
+  // (poche pagine, scansioni ben compresse) finisce in un'unica richiesta invece di
+  // essere spezzata inutilmente in più round-trip, che su reti instabili aumentano
+  // solo le occasioni di fallimento.
+  function buildDynamicChunks(files) {
+    const chunks = [];
+    let current = [];
+    let currentMB = 0;
+    files.forEach((f) => {
+      const fMB = f.sizeMB || 0.3;
+      const wouldExceed = current.length > 0 && (currentMB + fMB > MAX_CHUNK_MB || current.length >= MAX_FILES_PER_CHUNK);
+      if (wouldExceed) {
+        chunks.push(current);
+        current = [];
+        currentMB = 0;
+      }
+      current.push(f);
+      currentMB += fMB;
+    });
+    if (current.length > 0) chunks.push(current);
+    return chunks;
+  }
 
   if (window.pdfjsLib) {
     pdfjsLib.GlobalWorkerOptions.workerSrc = "https://unpkg.com/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
@@ -560,15 +584,17 @@ Nessun testo fuori dal JSON, niente blocchi markdown.`;
         const parsed = parseJsonSafe(result);
         if (Array.isArray(parsed)) allWines.push(...parsed);
       } else {
-        const totalChunks = Math.ceil(state.files.length / CHUNK_SIZE);
+        const chunks = buildDynamicChunks(state.files);
+        const totalChunks = chunks.length;
         const failedChunks = [];
-        for (let i = 0; i < state.files.length; i += CHUNK_SIZE) {
-          const chunkFiles = state.files.slice(i, i + CHUNK_SIZE);
-          const chunkNum = Math.floor(i / CHUNK_SIZE) + 1;
-          const rangeLabel = "pagine " + (i + 1) + "-" + Math.min(i + CHUNK_SIZE, state.files.length) + " di " + state.files.length;
+        let pagesDone = 0;
+        for (let chunkNum = 1; chunkNum <= chunks.length; chunkNum++) {
+          const chunkFiles = chunks[chunkNum - 1];
+          const rangeLabel = "pagine " + (pagesDone + 1) + "-" + (pagesDone + chunkFiles.length) + " di " + state.files.length;
+          pagesDone += chunkFiles.length;
 
           const content = [];
-          if (i === 0 && state.rawText.trim()) {
+          if (chunkNum === 1 && state.rawText.trim()) {
             content.push({ type: "text", text: "Testo della carta vini incollato dall'utente:\n" + state.rawText });
           }
           chunkFiles.forEach((f) => {
