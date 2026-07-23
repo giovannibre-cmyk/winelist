@@ -1,4 +1,4 @@
-const CACHE_NAME = "sommelier-shell-v1";
+const CACHE_NAME = "sommelier-shell-v2";
 const SHELL_FILES = [
   "./index.html",
   "./styles.css",
@@ -28,18 +28,29 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
 
-  // Never cache/intercept calls to the Anthropic API - always go to network.
-  if (url.hostname === "api.anthropic.com") {
+  // Non intercettare mai le chiamate all'API Anthropic o a CDN esterne (es. pdf.js).
+  if (url.hostname === "api.anthropic.com" || url.hostname !== self.location.hostname) {
     return;
   }
 
-  // Cache-first for the app shell, network fallback for everything else.
-  event.respondWith(
-    caches.match(event.request).then((cached) => {
-      return (
-        cached ||
-        fetch(event.request).catch(() => cached)
-      );
-    })
-  );
+  const isAppShell = /\.(html|js|css|json)$/.test(url.pathname) || url.pathname.endsWith("/");
+
+  if (isAppShell) {
+    // Network-first per l'app shell: così ogni aggiornamento caricato su GitHub
+    // arriva subito, invece di restare bloccati sulla versione vecchia in cache.
+    event.respondWith(
+      fetch(event.request)
+        .then((res) => {
+          const resClone = res.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, resClone));
+          return res;
+        })
+        .catch(() => caches.match(event.request))
+    );
+  } else {
+    // Cache-first per asset statici che cambiano raramente (icone).
+    event.respondWith(
+      caches.match(event.request).then((cached) => cached || fetch(event.request).catch(() => cached))
+    );
+  }
 });
